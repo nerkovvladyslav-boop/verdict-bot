@@ -162,16 +162,21 @@ CHAT_PROMPT = """
 """
 
 
-async def gemini_call(prompt: str, system: str, temperature: float = 0.45, max_tokens: int = 2200, attempts: int = 3) -> str:
+async def gemini_call(prompt: str, temperature: float = 0.4, max_tokens: int = 1400, attempts: int = 1) -> str:
+    """
+    Compatible anti-limit Gemini call.
+    Uses global SYSTEM_PROMPT, so generate_verdict does not need to pass 'system'.
+    """
     config = types.GenerateContentConfig(
-        system_instruction=system,
+        system_instruction=SYSTEM_PROMPT,
         temperature=temperature,
         max_output_tokens=max_tokens,
     )
+
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
 
     last_err = None
-    for i in range(attempts):
+    for i in range(max(1, attempts)):
         try:
             response = await asyncio.to_thread(
                 genai_client.models.generate_content,
@@ -182,9 +187,12 @@ async def gemini_call(prompt: str, system: str, temperature: float = 0.45, max_t
             text = (response.text or "").strip()
             if text:
                 return text
-            raise RuntimeError("empty model response")
+            raise RuntimeError("empty Gemini response")
         except Exception as exc:
             last_err = exc
+            # Do not retry long on quota errors
+            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc) or "Too Many Requests" in str(exc):
+                raise
             await asyncio.sleep(2 ** i)
 
     raise RuntimeError(f"gemini failed: {last_err}")
@@ -590,4 +598,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
