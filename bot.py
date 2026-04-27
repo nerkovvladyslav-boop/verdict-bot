@@ -463,9 +463,7 @@ async def generate_verdict(news_text: str) -> str:
         log.exception("gemini generation failed")
         return "⚠️ Ошибка генерации вердикта. Смотри логи Railway."
 
-    text = normalize_text(raw)
     text = clamp_percentages(text)
-    text = clean_country_garbage(text)
     text = clamp_percentages(text)
 
     # if output is obviously bad, do NOT retry; retries burn quota.
