@@ -431,36 +431,87 @@ def verdict_is_incomplete(text: str) -> bool:
 # =========================
 
 COUNTRY_WORDS = {
-    "россия": "Россия", "рф": "Россия",
-    "сша": "США", "америка": "США",
-    "китай": "Китай", "кнр": "Китай",
-    "тайвань": "Тайвань",
-    "иран": "Иран",
-    "израиль": "Израиль",
-    "украина": "Украина",
-    "беларусь": "Беларусь", "белоруссия": "Беларусь",
-    "польша": "Польша",
-    "германия": "Германия",
-    "франция": "Франция",
-    "норвегия": "Норвегия",
-    "турция": "Турция",
-    "алжир": "Алжир",
-    "тунис": "Тунис",
-    "нато": "НАТО",
-    "ес": "ЕС",
-    "оаэ": "ОАЭ",
-    "бахрейн": "Бахрейн",
+    "россия": "Россия", "рф": "Россия", "russia": "Россия",
+    "сша": "США", "usa": "США", "united_states": "США", "united_states_of_america": "США", "америка": "США",
+    "китай": "Китай", "кнр": "Китай", "china": "Китай", "prc": "Китай",
+    "тайвань": "Тайвань", "taiwan": "Тайвань",
+    "иран": "Иран", "iran": "Иран",
+    "израиль": "Израиль", "israel": "Израиль",
+    "украина": "Украина", "ukraine": "Украина",
+    "беларусь": "Беларусь", "белоруссия": "Беларусь", "belarus": "Беларусь",
+    "польша": "Польша", "poland": "Польша",
+    "германия": "Германия", "germany": "Германия",
+    "франция": "Франция", "france": "Франция",
+    "норвегия": "Норвегия", "norway": "Норвегия",
+    "турция": "Турция", "turkey": "Турция",
+    "алжир": "Алжир", "algeria": "Алжир",
+    "тунис": "Тунис", "tunisia": "Тунис",
+    "нато": "НАТО", "nato": "НАТО",
+    "ес": "ЕС", "eu": "ЕС", "european_union": "ЕС",
+    "оаэ": "ОАЭ", "uae": "ОАЭ",
+    "бахрейн": "Бахрейн", "bahrain": "Бахрейн",
+    "брикс": "БРИКС", "brics": "БРИКС",
+    "асеан": "АСЕАН", "asean": "АСЕАН",
+    "индия": "Индия", "india": "Индия",
 }
 
 
 def fallback_countries(text: str) -> list[str]:
     low = text.lower()
     found = []
-    for key, val in COUNTRY_WORDS.items():
-        if re.search(rf"(?<![а-яa-z]){re.escape(key)}(?![а-яa-z])", low):
+
+    # 1) Хэштеги имеют приоритет: #КНР, #United_States_of_America и т.д.
+    hashtags = re.findall(r"#([\w_]+)", low, flags=re.UNICODE)
+    for tag in hashtags:
+        tag_clean = tag.strip("_").lower()
+        if tag_clean in COUNTRY_WORDS:
+            val = COUNTRY_WORDS[tag_clean]
             if val not in found:
                 found.append(val)
-    return found[:5] or ["Основная сторона"]
+
+    # 2) Явные упоминания в тексте
+    for key, val in COUNTRY_WORDS.items():
+        if re.search(rf"(?<![а-яa-z0-9_]){re.escape(key)}(?![а-яa-z0-9_])", low):
+            if val not in found:
+                found.append(val)
+
+    # 3) Убираем мусор и дубли
+    banned = {"Арктика", "Севморпуть", "Регион", "Граница", "Балтика", "Пролив"}
+    fixed = []
+    for c in found:
+        if c in banned:
+            continue
+        if c not in fixed:
+            fixed.append(c)
+
+    return fixed[:6] or ["Основная сторона"]
+
+
+def pick_main_country(text: str, countries: list[str]) -> str:
+    low = text.lower()
+
+    # Хэштег-страна = почти всегда автор поста/инициатор
+    hashtags = re.findall(r"#([\w_]+)", low, flags=re.UNICODE)
+    for tag in hashtags:
+        tag_clean = tag.strip("_").lower()
+        if tag_clean in COUNTRY_WORDS:
+            val = COUNTRY_WORDS[tag_clean]
+            if val in countries:
+                return val
+
+    # Если в первых строках есть страна, даём ей приоритет
+    first_part = "\n".join(text.splitlines()[:4]).lower()
+    for key, val in COUNTRY_WORDS.items():
+        if val in countries and re.search(rf"(?<![а-яa-z0-9_]){re.escape(key)}(?![а-яa-z0-9_])", first_part):
+            return val
+
+    # Организации не должны становиться инициатором, если есть государство
+    orgs = {"НАТО", "ЕС", "БРИКС", "АСЕАН"}
+    for c in countries:
+        if c not in orgs:
+            return c
+
+    return countries[0]
 
 
 def fallback_event_type(text: str) -> str:
@@ -494,6 +545,7 @@ def fallback_effects(event_type: str) -> tuple[dict, str]:
         "economy": ({"Экономика": 2, "Военка": 0, "Политика": 1, "Общество": 1, "Дипломатия": 0, "ИТОГ": 1}, "умеренный экономический эффект"),
         "energy": ({"Экономика": 2, "Военка": 0, "Политика": 1, "Общество": 0, "Дипломатия": 1, "ИТОГ": 1}, "энергетический эффект без резкого перелома"),
         "geopolitics": ({"Экономика": 1, "Военка": 2, "Политика": 1, "Общество": 0, "Дипломатия": -1, "ИТОГ": 1}, "геополитическое укрепление с риском напряжения"),
+        "geoeconomy": ({"Экономика": 3, "Военка": 0, "Политика": 2, "Общество": 1, "Дипломатия": 2, "ИТОГ": 2}, "рост экономического влияния через финансы и инфраструктуру"),
         "general": ({"Экономика": 1, "Военка": 0, "Политика": 1, "Общество": 0, "Дипломатия": 0, "ИТОГ": 1}, "ограниченный эффект по заявленному действию"),
     }
     return table.get(event_type, table["general"])
@@ -515,6 +567,20 @@ def fmt_pct(v) -> str:
 
 def fallback_change_line(country: str, event_type: str, idx: int) -> str:
     c = country
+
+    # Организации/блоки получают реакционные изменения, а не "закупки ПО" или чужие войска
+    if c in {"НАТО", "ЕС", "БРИКС", "АСЕАН"}:
+        if event_type in {"military", "strike"}:
+            return f"• {c}: расходы мониторинга +25 млн $; координационных миссий +8 ед. — реакция на военную угрозу."
+        if event_type in {"geoeconomy", "tech", "economy"}:
+            return f"• {c}: аналитические проверки +10 ед.; регуляторные расходы +12 млн $ — реакция на экономическую экспансию."
+        return f"• {c}: консультаций +6 ед.; административные расходы +5 млн $ — реакция на событие."
+
+    if event_type == "geoeconomy":
+        if idx == 0:
+            return f"• {c}: расчёты в цифровой валюте +45 млрд $; инфраструктурные контракты +180 ед. — расширение экономического влияния."
+        return f"• {c}: торговые расчёты через новые каналы +6 млрд $; зависимость от поставок +4% — включение в китайские цепочки."
+
     if event_type == "strike":
         if idx == 0:
             return f"• {c}: боеприпасы -120 ед.; военные расходы +480 млн $ — проведение ударов."
@@ -556,7 +622,7 @@ def smart_fallback_verdict(news_text: str, reason: str = "") -> str:
     countries = fallback_countries(news_text)
     event_type = fallback_event_type(news_text)
     effects, note = fallback_effects(event_type)
-    main = countries[0]
+    main = pick_main_country(news_text, countries)
 
     if event_type == "strike":
         verdict = f"{main} переходит к прямому военному давлению, что резко повышает риск региональной эскалации."
@@ -578,6 +644,11 @@ def smart_fallback_verdict(news_text: str, reason: str = "") -> str:
         plus1 = f"{main}: получает пространство для манёвра и переговоров."
         minus1 = "Партнёры: требуют гарантий, контроля и дополнительных консультаций."
         realism = "Реалистично при политической воле сторон и наличии механизмов контроля."
+    elif event_type == "geoeconomy":
+        verdict = f"{main} усиливает глобальное экономическое влияние через цифровую валюту, инфраструктуру и производственные цепочки."
+        plus1 = f"{main}: расширяет расчёты в собственной валюте и закрепляется в развивающихся рынках."
+        minus1 = "Конкуренты: получают риск вытеснения из финансовых и инфраструктурных проектов."
+        realism = "Реалистично для Китая при наличии банковской инфраструктуры, капитала и зависимости партнёров от поставок."
     elif event_type == "tech":
         verdict = f"{main} усиливает технологическое направление, пытаясь расширить экономическую самостоятельность."
         plus1 = f"{main}: получает рост инвестиций, проектов и технологической занятости."
