@@ -32,7 +32,16 @@ def env(name: str, default: str = "", required: bool = False) -> str:
 
 
 BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
-GEMINI_API_KEY = env("AI_INTEGRATIONS_GEMINI_API_KEY") or env("GEMINI_API_KEY", required=True)
+GEMINI_API_KEY = env("AI_INTEGRATIONS_GEMINI_API_KEY") or env("GEMINI_API_KEY", "")
+GEMINI_KEYS_RAW = env("GEMINI_KEYS", "")
+GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_RAW.split(",") if k.strip()]
+
+# Backward compatibility: if GEMINI_KEYS is empty, use GEMINI_API_KEY
+if not GEMINI_KEYS and GEMINI_API_KEY:
+    GEMINI_KEYS = [GEMINI_API_KEY]
+
+if not GEMINI_KEYS:
+    raise RuntimeError("missing Gemini API key: set GEMINI_API_KEY or GEMINI_KEYS")
 GEMINI_BASE_URL = env("AI_INTEGRATIONS_GEMINI_BASE_URL") or env("GEMINI_BASE_URL")
 GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -74,11 +83,20 @@ except ValueError:
     VERDICT_THREAD_ID = None
 
 
-genai_kwargs = {"api_key": GEMINI_API_KEY}
-if GEMINI_BASE_URL:
-    genai_kwargs["http_options"] = {"base_url": GEMINI_BASE_URL, "api_version": ""}
+CURRENT_GEMINI_KEY_INDEX = 0
 
-genai_client = genai.Client(**genai_kwargs)
+
+def make_genai_client(api_key: str) -> genai.Client:
+    kwargs = {"api_key": api_key}
+    if GEMINI_BASE_URL:
+        kwargs["http_options"] = {"base_url": GEMINI_BASE_URL, "api_version": ""}
+    return genai.Client(**kwargs)
+
+
+def current_key_label() -> str:
+    if not GEMINI_KEYS:
+        return "none"
+    return f"{CURRENT_GEMINI_KEY_INDEX + 1}/{len(GEMINI_KEYS)}"
 
 
 SYSTEM_PROMPT = """
@@ -164,22 +182,33 @@ CHAT_PROMPT = """
 
 async def gemini_call(prompt: str, temperature: float = 0.4, max_tokens: int = 1400, attempts: int = 1) -> str:
     """
-    Compatible anti-limit Gemini call.
-    Uses global SYSTEM_PROMPT, so generate_verdict does not need to pass 'system'.
+    Multi-key anti-limit Gemini call.
+    Uses GEMINI_KEYS=key1,key2,key3 from Railway Variables.
+    On 429 / RESOURCE_EXHAUSTED it switches to next key automatically.
     """
+    global CURRENT_GEMINI_KEY_INDEX
+
+    if not GEMINI_KEYS:
+        raise RuntimeError("No Gemini keys configured")
+
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         temperature=temperature,
         max_output_tokens=max_tokens,
     )
-
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
 
     last_err = None
-    for i in range(max(1, attempts)):
+
+    # Try every key once. This avoids burning quota with repeated retries on the same exhausted key.
+    for _ in range(len(GEMINI_KEYS)):
+        api_key = GEMINI_KEYS[CURRENT_GEMINI_KEY_INDEX]
+        client = make_genai_client(api_key)
+
         try:
+            log.info("Gemini request using key %s model=%s", current_key_label(), GEMINI_MODEL)
             response = await asyncio.to_thread(
-                genai_client.models.generate_content,
+                client.models.generate_content,
                 model=GEMINI_MODEL,
                 contents=contents,
                 config=config,
@@ -187,15 +216,22 @@ async def gemini_call(prompt: str, temperature: float = 0.4, max_tokens: int = 1
             text = (response.text or "").strip()
             if text:
                 return text
-            raise RuntimeError("empty Gemini response")
+            last_err = RuntimeError("empty Gemini response")
         except Exception as exc:
             last_err = exc
-            # Do not retry long on quota errors
-            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc) or "Too Many Requests" in str(exc):
-                raise
-            await asyncio.sleep(2 ** i)
+            err = str(exc)
 
-    raise RuntimeError(f"gemini failed: {last_err}")
+            if "429" in err or "RESOURCE_EXHAUSTED" in err or "Too Many Requests" in err or "quota" in err.lower():
+                log.warning("Gemini key %s exhausted/rate-limited, switching key", current_key_label())
+                CURRENT_GEMINI_KEY_INDEX = (CURRENT_GEMINI_KEY_INDEX + 1) % len(GEMINI_KEYS)
+                continue
+
+            # Non-quota errors: try next key once too, but keep log clear
+            log.warning("Gemini key %s failed: %s", current_key_label(), exc)
+            CURRENT_GEMINI_KEY_INDEX = (CURRENT_GEMINI_KEY_INDEX + 1) % len(GEMINI_KEYS)
+            continue
+
+    raise RuntimeError(f"all Gemini keys failed/exhausted: {last_err}")
 
 
 def strip_html(text: str) -> str:
@@ -418,9 +454,9 @@ async def generate_verdict(news_text: str) -> str:
             # Cooldown prevents spam-retrying and burning logs.
             LAST_429_UNTIL = time.time() + 10 * 60
             return (
-                "⚠️ Лимит Gemini API исчерпан.\n\n"
+                "⚠️ Все Gemini API ключи временно исчерпаны.\n\n"
                 "Причина: 429 Too Many Requests / RESOURCE_EXHAUSTED.\n"
-                "Подожди обновления квоты или поставь другой GEMINI_API_KEY.\n"
+                "Подожди обновления квоты или добавь новые ключи в GEMINI_KEYS.\n"
                 "Бот живой, но ИИ сейчас не отвечает."
             )
 
@@ -534,6 +570,16 @@ async def on_whoami(message: Message) -> None:
     await message.answer(f"id: {user.id if user else 'unknown'}\nchat_id: {message.chat.id}")
 
 
+
+@router.message(Command("keys"))
+async def on_keys(message: Message) -> None:
+    await message.answer(
+        f"Gemini keys: {len(GEMINI_KEYS)}\n"
+        f"Current key: {current_key_label()}\n"
+        f"Model: {GEMINI_MODEL}"
+    )
+
+
 @router.message(Command("test"))
 async def on_test(message: Message, bot: Bot) -> None:
     await message.answer("тест ок")
@@ -575,6 +621,7 @@ async def main() -> None:
 
     log.info("starting bot")
     log.info("CHANNEL_ID=%s VERDICT_CHANNEL_ID=%s THREAD=%s", CHANNEL_ID, VERDICT_CHANNEL_ID, VERDICT_THREAD_ID)
+    log.info("Gemini keys loaded: %s current=%s", len(GEMINI_KEYS), current_key_label())
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
     dp = Dispatcher()
@@ -598,4 +645,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
