@@ -466,7 +466,6 @@ async def generate_verdict(news_text: str) -> str:
     text = normalize_text(raw)
     text = clamp_percentages(text)
     text = clean_country_garbage(text)
-    text = cleanup_model_garbage(text)
     text = clamp_percentages(text)
 
     # if output is obviously bad, do NOT retry; retries burn quota.
