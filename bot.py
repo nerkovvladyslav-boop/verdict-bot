@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import aiohttp
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -35,6 +36,9 @@ BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
 GEMINI_API_KEY = env("AI_INTEGRATIONS_GEMINI_API_KEY") or env("GEMINI_API_KEY", required=True)
 GEMINI_BASE_URL = env("AI_INTEGRATIONS_GEMINI_BASE_URL") or env("GEMINI_BASE_URL")
 GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_BACKUP_MODEL = env("GEMINI_BACKUP_MODEL", "gemini-2.5-flash-lite")
+OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = env("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
 
 # fallback стоит под твой старый канал, чтобы бот не молчал
 RAW_CHANNEL_ID = env("TELEGRAM_CHANNEL_ID", "-1003993603387").strip()
@@ -227,6 +231,163 @@ async def gemini_call(prompt: str, system: str, temperature: float = 0.45, max_t
             await asyncio.sleep(2 ** i)
 
     raise RuntimeError(f"gemini failed: {last_err}")
+
+
+
+async def openrouter_call(prompt: str, system: str, temperature: float = 0.45, max_tokens: int = 1800) -> str:
+    """
+    Backup provider. Requires OPENROUTER_API_KEY in Railway Variables.
+    """
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing")
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://railway.app",
+        "X-Title": "WORLD OF RETURN Verdict Bot",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 400:
+                raise RuntimeError(f"openrouter failed {resp.status}: {data}")
+
+            try:
+                text = data["choices"][0]["message"]["content"].strip()
+            except Exception:
+                text = ""
+
+            if not text:
+                raise RuntimeError(f"openrouter empty response: {data}")
+
+            return text
+
+
+def fallback_local_generate(news_text: str) -> str:
+    """
+    Last-resort no-AI fallback. It keeps the bot alive when all AI quotas fail.
+    """
+    raw = (news_text or "").strip()
+    low = raw.lower()
+
+    countries = []
+    aliases = {
+        "норвег": "Норвегия", "росси": "Россия", "рф": "Россия", "китай": "Китай",
+        "тайван": "Тайвань", "сша": "США", "иран": "Иран", "израил": "Израиль",
+        "украин": "Украина", "турц": "Турция", "алжир": "Алжир", "тунис": "Тунис",
+        "беларус": "Беларусь", "герман": "Германия", "франц": "Франция",
+        "брит": "Великобритания", "ес": "ЕС", "нато": "НАТО",
+    }
+    for key, val in aliases.items():
+        if key in low and val not in countries:
+            countries.append(val)
+
+    if not countries:
+        countries = ["Основная сторона"]
+
+    if any(w in low for w in ["войск", "границ", "арм", "бригад", "база", "учен", "пво", "рак", "удар", "дрон", "бпла"]):
+        verdict = f"{countries[0]} проводит военное усиление, повышая давление на региональную безопасность."
+        plus = f"{countries[0]}: усиливает оперативную готовность и контроль направления."
+        minus = "Регион: растёт риск эскалации, инцидентов и ответных мер."
+        effect = ("• Экономика: -1%\n• Военка: +3%\n• Политика: +1%\n• Общество: -1%\n• Дипломатия: -2%\n• ИТОГ: 0% — военное усиление с дипломатическими рисками.")
+        changes = "\n".join([f"• {c}: военные расходы +45 млн $; личный состав +2500 чел. — усиление группировки." for c in countries])
+        realism = "Реалистично при наличии снабжения, подготовленных частей и политического решения."
+    elif any(w in low for w in ["it", "стартап", "цифров", "техно", "сэз", "компан"]):
+        verdict = f"{countries[0]} запускает технологическое развитие, снижая зависимость от сырьевых доходов."
+        plus = f"{countries[0]}: получает рост IT-сектора и новых рабочих мест."
+        minus = f"{countries[0]}: нужны бюджет, кадры и защита от коррупции при льготах."
+        effect = ("• Экономика: +2%\n• Военка: 0%\n• Политика: +1%\n• Общество: +1%\n• Дипломатия: +1%\n• ИТОГ: +1% — умеренное технологическое усиление.")
+        changes = "\n".join([f"• {c}: инвестиции в IT +80 млн $; новых проектов +120 ед. — запуск техзон." for c in countries])
+        realism = "Реалистично при поэтапном финансировании, налоговых льготах и контроле заявок."
+    elif any(w in low for w in ["агро", "орош", "урож", "вода", "ферм", "сельск"]):
+        verdict = f"{countries[0]} усиливает агротехнологический сектор за счёт водосберегающих решений."
+        plus = f"{countries[0]}: повышает эффективность сельского хозяйства и экспорт технологий."
+        minus = f"{countries[0]}: нужны капитальные вложения и сервисное сопровождение проектов."
+        effect = ("• Экономика: +2%\n• Военка: 0%\n• Политика: 0%\n• Общество: +1%\n• Дипломатия: +1%\n• ИТОГ: +1% — практический технологический плюс.")
+        changes = "\n".join([f"• {c}: экспорт агротехнологий +90 млн $; систем орошения +120 ед. — внедрение решений." for c in countries])
+        realism = "Реалистично, если есть технологическая база, партнёры и финансирование внедрения."
+    else:
+        verdict = f"{countries[0]} проводит инициативу с ограниченным, но заметным управленческим эффектом."
+        plus = f"{countries[0]}: получает пространство для дальнейших действий."
+        minus = f"{countries[0]}: несёт дополнительные расходы и риски реализации."
+        effect = ("• Экономика: +1%\n• Военка: 0%\n• Политика: +1%\n• Общество: 0%\n• Дипломатия: 0%\n• ИТОГ: +1% — ограниченный эффект.")
+        changes = "\n".join([f"• {c}: бюджет программы +25 млн $; проектов +18 ед. — реализация инициативы." for c in countries])
+        realism = "Реалистично при достаточном бюджете, сроках и административном контроле."
+
+    return f"""📌 Вердикт
+{verdict}
+
+🌍 Страны: {", ".join(countries)}.
+
+➕ Плюсы
+• {plus}
+
+➖ Минусы
+• {minus}
+
+📈 Эффект (%)
+{effect}
+
+💰 Изменения по странам
+{changes}
+
+⚠️ Реализм
+{realism}
+
+🤝 Ответ на ультиматум/требование
+Не применимо."""
+
+
+async def ai_call_multi(prompt: str, system: str, temperature: float = 0.45, max_tokens: int = 1800) -> str:
+    """
+    Provider chain:
+    1) Gemini main model
+    2) Gemini backup model
+    3) OpenRouter model if OPENROUTER_API_KEY exists
+    4) Local fallback without AI
+    """
+    # 1. Gemini main
+    try:
+        return await gemini_call(prompt, system, temperature=temperature, max_tokens=max_tokens, attempts=1)
+    except Exception as exc:
+        log.warning("Gemini main failed: %s", exc)
+
+    # 2. Gemini backup model
+    global GEMINI_MODEL
+    original_model = GEMINI_MODEL
+    try:
+        GEMINI_MODEL = GEMINI_BACKUP_MODEL
+        return await gemini_call(prompt, system, temperature=temperature, max_tokens=max_tokens, attempts=1)
+    except Exception as exc:
+        log.warning("Gemini backup failed: %s", exc)
+    finally:
+        GEMINI_MODEL = original_model
+
+    # 3. OpenRouter
+    try:
+        return await openrouter_call(prompt, system, temperature=temperature, max_tokens=max_tokens)
+    except Exception as exc:
+        log.warning("OpenRouter failed: %s", exc)
+
+    # 4. Local fallback
+    return fallback_local_generate(prompt)
 
 
 def strip_html(text: str) -> str:
@@ -543,23 +704,17 @@ async def generate_verdict(news_text: str) -> str:
         f"Пост:\n{news_text[:4000]}"
     )
 
-    last = ""
-    for temperature in (0.35, 0.55, 0.75):
-        raw = await gemini_call(prompt, SYSTEM_PROMPT, temperature=temperature, max_tokens=2200, attempts=2)
-        text = normalize_text(raw)
-        text = clamp_percentages(text)
-        text = clean_country_garbage(text)
-        text = cleanup_model_garbage(text)
-        text = fix_material_country_changes(text, news_text)
-        text = cleanup_model_garbage(text)
-        text = clamp_percentages(text)
+    raw = await ai_call_multi(prompt, SYSTEM_PROMPT, temperature=0.45, max_tokens=1800)
 
-        last = text
+    text = normalize_text(raw)
+    text = clamp_percentages(text)
+    text = clean_country_garbage(text)
+    text = cleanup_model_garbage(text)
+    text = fix_material_country_changes(text, news_text)
+    text = cleanup_model_garbage(text)
+    text = clamp_percentages(text)
 
-        if is_complete(text) and not is_bad_template(text):
-            return text
-
-    return last.strip()
+    return text.strip()
 
 
 def has_trigger(text: str) -> bool:
