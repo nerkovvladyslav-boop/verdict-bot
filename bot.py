@@ -185,14 +185,14 @@ SYSTEM_PROMPT = """
 - дипломатическое соглашение: 1–20 млн $ админрасходов, 2–20 проверок/миссий/комиссий
 
 ОГРАНИЧЕНИЯ:
-- До 1700 символов.
+- До 2300 символов.
 - Проценты обычно от -1% до +3%.
 - Больше ±5% только при войне/кризисе.
 - Не используй -50%, -90%, -100%.
 """
 
 
-async def gemini_call(prompt: str, temperature: float = 0.35, max_tokens: int = 1400) -> str:
+async def gemini_call(prompt: str, temperature: float = 0.35, max_tokens: int = 2400) -> str:
     """
     Multi-key anti-limit call.
     Пробует каждый ключ один раз. Если 429/503 — переключает ключ.
@@ -391,6 +391,252 @@ def is_obviously_bad(text: str) -> bool:
     return any(x.lower() in low for x in bad)
 
 
+
+REQUIRED_VERDICT_BLOCKS = [
+    "📌 Вердикт",
+    "🌍 Страны",
+    "➕ Плюсы",
+    "➖ Минусы",
+    "📈 Эффект",
+    "💰 Изменения по странам",
+    "⚠️ Реализм",
+    "🤝 Ответ",
+]
+
+
+def verdict_is_incomplete(text: str) -> bool:
+    if not text or len(text.strip()) < 500:
+        return True
+
+    plain = strip_html(text)
+    missing = [b for b in REQUIRED_VERDICT_BLOCKS if b not in plain]
+    if missing:
+        return True
+
+    # Looks cut off if last required block exists but has no actual answer
+    tail = plain.split("🤝 Ответ", 1)[-1].strip() if "🤝 Ответ" in plain else ""
+    if len(tail) < 12:
+        return True
+
+    # Common signs of truncation
+    if plain.rstrip().endswith(("•", ":", ",", ";", "—", "-", "и", "или")):
+        return True
+
+    return False
+
+
+
+# =========================
+# SMART FALLBACK WITHOUT AI
+# =========================
+
+COUNTRY_WORDS = {
+    "россия": "Россия", "рф": "Россия",
+    "сша": "США", "америка": "США",
+    "китай": "Китай", "кнр": "Китай",
+    "тайвань": "Тайвань",
+    "иран": "Иран",
+    "израиль": "Израиль",
+    "украина": "Украина",
+    "беларусь": "Беларусь", "белоруссия": "Беларусь",
+    "польша": "Польша",
+    "германия": "Германия",
+    "франция": "Франция",
+    "норвегия": "Норвегия",
+    "турция": "Турция",
+    "алжир": "Алжир",
+    "тунис": "Тунис",
+    "нато": "НАТО",
+    "ес": "ЕС",
+    "оаэ": "ОАЭ",
+    "бахрейн": "Бахрейн",
+}
+
+
+def fallback_countries(text: str) -> list[str]:
+    low = text.lower()
+    found = []
+    for key, val in COUNTRY_WORDS.items():
+        if re.search(rf"(?<![а-яa-z]){re.escape(key)}(?![а-яa-z])", low):
+            if val not in found:
+                found.append(val)
+    return found[:5] or ["Основная сторона"]
+
+
+def fallback_event_type(text: str) -> str:
+    low = text.lower()
+    if any(w in low for w in ["ракета", "ракет", "удар", "обстрел", "пво", "дрон", "бпла", "шахед", "бомб"]):
+        return "strike"
+    if any(w in low for w in ["войск", "границ", "переброс", "база", "арм", "учени", "учен", "бригада", "батальон", "дивиз", "техника", "мобилиз"]):
+        return "military"
+    if any(w in low for w in ["протест", "митинг", "забастов", "беспоряд", "демонстрац"]):
+        return "protest"
+    if any(w in low for w in ["договор", "соглашен", "нейтрализац", "ультиматум", "переговор", "санкц"]):
+        return "diplomacy"
+    if any(w in low for w in ["it", "айти", "стартап", "цифров", "техно", "сэз", "компан", "инновац"]):
+        return "tech"
+    if any(w in low for w in ["эконом", "бюджет", "налог", "бизнес", "мсб", "инвест", "банк"]):
+        return "economy"
+    if any(w in low for w in ["газ", "нефт", "энерг", "электро", "мвт", "трубопровод"]):
+        return "energy"
+    if any(w in low for w in ["арктик", "севморпуть", "порт", "логист"]):
+        return "geopolitics"
+    return "general"
+
+
+def fallback_effects(event_type: str) -> tuple[dict, str]:
+    table = {
+        "strike": ({"Экономика": -3, "Военка": 4, "Политика": -3, "Общество": -4, "Дипломатия": -5, "ИТОГ": -4}, "военная эскалация с серьёзными рисками"),
+        "military": ({"Экономика": -1, "Военка": 3, "Политика": 1, "Общество": -1, "Дипломатия": -2, "ИТОГ": 0}, "военное усиление при росте напряжённости"),
+        "protest": ({"Экономика": -1, "Военка": 0, "Политика": -3, "Общество": -3, "Дипломатия": -1, "ИТОГ": -2}, "внутриполитическое давление растёт"),
+        "diplomacy": ({"Экономика": 0, "Военка": -1, "Политика": 1, "Общество": 0, "Дипломатия": 2, "ИТОГ": 1}, "дипломатический сдвиг с рисками доверия"),
+        "tech": ({"Экономика": 2, "Военка": 0, "Политика": 1, "Общество": 1, "Дипломатия": 1, "ИТОГ": 1}, "технологическое усиление с умеренным эффектом"),
+        "economy": ({"Экономика": 2, "Военка": 0, "Политика": 1, "Общество": 1, "Дипломатия": 0, "ИТОГ": 1}, "умеренный экономический эффект"),
+        "energy": ({"Экономика": 2, "Военка": 0, "Политика": 1, "Общество": 0, "Дипломатия": 1, "ИТОГ": 1}, "энергетический эффект без резкого перелома"),
+        "geopolitics": ({"Экономика": 1, "Военка": 2, "Политика": 1, "Общество": 0, "Дипломатия": -1, "ИТОГ": 1}, "геополитическое укрепление с риском напряжения"),
+        "general": ({"Экономика": 1, "Военка": 0, "Политика": 1, "Общество": 0, "Дипломатия": 0, "ИТОГ": 1}, "ограниченный эффект по заявленному действию"),
+    }
+    return table.get(event_type, table["general"])
+
+
+def fmt_pct(v) -> str:
+    try:
+        v = float(v)
+    except Exception:
+        v = 0
+    if abs(v) < 0.05:
+        return "0%"
+    if v.is_integer():
+        n = int(v)
+        return f"+{n}%" if n > 0 else f"{n}%"
+    s = f"{v:.1f}".replace(".", ",")
+    return f"+{s}%" if v > 0 else f"{s}%"
+
+
+def fallback_change_line(country: str, event_type: str, idx: int) -> str:
+    c = country
+    if event_type == "strike":
+        if idx == 0:
+            return f"• {c}: боеприпасы -120 ед.; военные расходы +480 млн $ — проведение ударов."
+        return f"• {c}: ущерб инфраструктуре +350 млн $; повреждено объектов +12 ед. — последствия удара."
+    if event_type == "military":
+        if idx == 0:
+            return f"• {c}: военные расходы +55 млн $; личный состав +3200 чел. — переброска сил."
+        return f"• {c}: расходы наблюдения +12 млн $; пограничные патрули +450 чел. — ответное усиление."
+    if event_type == "protest":
+        if idx == 0:
+            return f"• {c}: расходы полиции +18 млн $; задержано +600 чел. — массовые протесты."
+        return f"• {c}: дипмиссии +4 проверки; расходы безопасности +6 млн $ — реакция на кризис."
+    if event_type == "diplomacy":
+        if idx == 0:
+            return f"• {c}: дипломатические миссии +6 ед.; админрасходы +8 млн $ — оформление соглашения."
+        return f"• {c}: проверки безопасности +5 ед.; расходы мониторинга +10 млн $ — контроль договорённостей."
+    if event_type == "tech":
+        if idx == 0:
+            return f"• {c}: инвестиции в технологии +90 млн $; проектов +120 ед. — запуск программы."
+        return f"• {c}: закупки ПО +18 млн $; совместных проектов +25 ед. — технологическая интеграция."
+    if event_type == "economy":
+        if idx == 0:
+            return f"• {c}: фонд программы +70 млн $; заявок бизнеса +1400 ед. — экономическое стимулирование."
+        return f"• {c}: торговые контракты +35 млн $; проверок +8 ед. — участие в программе."
+    if event_type == "energy":
+        if idx == 0:
+            return f"• {c}: энергетические инвестиции +140 млн $; мощность проектов +220 МВт — расширение сектора."
+        return f"• {c}: импортные расходы +30 млн $; резерв мощности +80 МВт — энергетические закупки."
+    if event_type == "geopolitics":
+        if idx == 0:
+            return f"• {c}: арктические расходы +85 млн $; объектов обеспечения +6 ед. — усиление присутствия."
+        return f"• {c}: расходы мониторинга +18 млн $; патрульные миссии +10 ед. — реакция на активность."
+    if idx == 0:
+        return f"• {c}: бюджет инициативы +25 млн $; проектов +18 ед. — реализация действия."
+    return f"• {c}: ответные расходы +9 млн $; проверок +6 ед. — адаптация к событию."
+
+
+def smart_fallback_verdict(news_text: str, reason: str = "") -> str:
+    countries = fallback_countries(news_text)
+    event_type = fallback_event_type(news_text)
+    effects, note = fallback_effects(event_type)
+    main = countries[0]
+
+    if event_type == "strike":
+        verdict = f"{main} переходит к прямому военному давлению, что резко повышает риск региональной эскалации."
+        plus1 = f"{main}: получает краткосрочную военную инициативу."
+        minus1 = "Затронутые стороны: получают ущерб инфраструктуре и рост оборонных расходов."
+        realism = "Реалистично только при наличии подготовленных сил, запасов боеприпасов и политического решения."
+    elif event_type == "military":
+        verdict = f"{main} усиливает военное присутствие, повышая контроль направления и давление на соседей."
+        plus1 = f"{main}: повышает боеготовность и скорость реагирования."
+        minus1 = "Регион: растёт риск инцидентов и ответных мер."
+        realism = "Реалистично при наличии снабжения, подготовленных частей и понятной цели переброски."
+    elif event_type == "protest":
+        verdict = f"{main} сталкивается с внутренним протестным давлением из-за спорного политического решения."
+        plus1 = "Оппозиция: получает мобилизационный повод и рост публичной активности."
+        minus1 = f"{main}: теряет управляемость и тратит ресурсы на стабилизацию."
+        realism = "Реалистично, если решение воспринимается обществом как непрозрачное или противоречивое."
+    elif event_type == "diplomacy":
+        verdict = f"{main} меняет дипломатическую линию, создавая новый баланс договорённостей и рисков доверия."
+        plus1 = f"{main}: получает пространство для манёвра и переговоров."
+        minus1 = "Партнёры: требуют гарантий, контроля и дополнительных консультаций."
+        realism = "Реалистично при политической воле сторон и наличии механизмов контроля."
+    elif event_type == "tech":
+        verdict = f"{main} усиливает технологическое направление, пытаясь расширить экономическую самостоятельность."
+        plus1 = f"{main}: получает рост инвестиций, проектов и технологической занятости."
+        minus1 = "Бюджет: получает нагрузку на субсидии, контроль и инфраструктуру."
+        realism = "Реалистично при стабильном финансировании, кадрах и защите инвестиций."
+    elif event_type == "economy":
+        verdict = f"{main} запускает экономическую инициативу с умеренным эффектом для бизнеса и бюджета."
+        plus1 = f"{main}: стимулирует внутреннюю активность и занятость."
+        minus1 = "Бюджет: несёт расходы на запуск и контроль программы."
+        realism = "Реалистично при поэтапном финансировании и прозрачном администрировании."
+    elif event_type == "energy":
+        verdict = f"{main} усиливает энергетическое направление, получая экономический эффект и новые обязательства."
+        plus1 = f"{main}: получает дополнительную выручку или устойчивость поставок."
+        minus1 = "Партнёры: несут расходы на логистику и контрактное сопровождение."
+        realism = "Реалистично при наличии инфраструктуры, контрактов и стабильной логистики."
+    elif event_type == "geopolitics":
+        verdict = f"{main} усиливает геополитическое присутствие, повышая значение стратегического направления."
+        plus1 = f"{main}: укрепляет контроль над важной зоной и логистикой."
+        minus1 = "Регион: получает рост конкуренции и риска военных инцидентов."
+        realism = "Реалистично при наличии баз, снабжения и долгосрочного финансирования."
+    else:
+        verdict = f"{main} реализует заявленное действие с умеренными политическими и материальными последствиями."
+        plus1 = f"{main}: получает ограниченный практический выигрыш."
+        minus1 = "Участники: сталкиваются с расходами и рисками реализации."
+        realism = "Оценка ограничена, потому что ИИ-модель временно недоступна."
+
+    changes = "\n".join(fallback_change_line(c, event_type, i) for i, c in enumerate(countries))
+
+    return f"""📌 Вердикт
+{verdict}
+
+🌍 Страны: {", ".join(countries)}.
+
+➕ Плюсы
+• {plus1}
+• Реализация заявленного действия создаёт краткосрочный управленческий эффект.
+
+➖ Минусы
+• {minus1}
+• Возможны дополнительные расходы, политические споры и внешняя реакция.
+
+📈 Эффект (%)
+• Экономика: {fmt_pct(effects["Экономика"])}
+• Военка: {fmt_pct(effects["Военка"])}
+• Политика: {fmt_pct(effects["Политика"])}
+• Общество: {fmt_pct(effects["Общество"])}
+• Дипломатия: {fmt_pct(effects["Дипломатия"])}
+• ИТОГ: {fmt_pct(effects["ИТОГ"])} — {note}.
+
+💰 Изменения по странам
+{changes}
+
+⚠️ Реализм
+{realism}
+
+🤝 Ответ на ультиматум/требование
+Не применимо."""
+
+
 # =========================
 # VERDICT
 # =========================
@@ -404,23 +650,20 @@ async def generate_verdict(news_text: str) -> str:
 
     now = time.time()
     if LAST_429_UNTIL and now < LAST_429_UNTIL:
-        mins = max(1, int((LAST_429_UNTIL - now) // 60))
-        return (
-            "⚠️ Лимит ИИ временно исчерпан.\n\n"
-            f"Попробуй примерно через {mins} мин. Бот живой, но Gemini пока не отвечает."
-        )
+        return smart_fallback_verdict(news_text, reason="cooldown")
 
     prompt = (
         "Сделай вердикт строго по этому посту. "
         "Не используй шаблоны. Не подставляй одинаковые строки всем странам. "
         "Не придумывай энергетику/нефть/баррели, если этого нет.\n\n"
-        f"ПОСТ:\n{news_text[:3500]}"
+        f"ПОСТ:\n{news_text[:5000]}"
     )
 
     try:
-        raw = await gemini_call(prompt, temperature=0.35, max_tokens=1400)
+        raw = await gemini_call(prompt, temperature=0.35, max_tokens=2400)
     except Exception as exc:
         err = str(exc)
+
         if (
             "429" in err
             or "RESOURCE_EXHAUSTED" in err
@@ -428,23 +671,29 @@ async def generate_verdict(news_text: str) -> str:
             or "quota" in err.lower()
         ):
             LAST_429_UNTIL = time.time() + 10 * 60
-            return (
-                "⚠️ Все Gemini API ключи временно исчерпаны.\n\n"
-                "Причина: 429 Too Many Requests / RESOURCE_EXHAUSTED.\n"
-                "Добавь новые ключи в GEMINI_KEYS или подожди обновления квоты."
-            )
+            log.warning("Gemini quota exhausted, using smart fallback")
+            return smart_fallback_verdict(news_text, reason="quota")
 
-        log.exception("Gemini generation failed")
-        return "⚠️ Ошибка генерации вердикта. Смотри логи Railway."
+        if (
+            "503" in err
+            or "UNAVAILABLE" in err
+            or "Service Unavailable" in err
+            or "high demand" in err.lower()
+        ):
+            log.warning("Gemini unavailable/high demand, using smart fallback")
+            return smart_fallback_verdict(news_text, reason="unavailable")
+
+        log.exception("Gemini generation failed, using smart fallback")
+        return smart_fallback_verdict(news_text, reason="error")
 
     text = raw.strip()
     text = soft_fix(text)
     text = clamp_percentages(text)
 
-    if is_obviously_bad(text):
+    if is_obviously_bad(text) or verdict_is_incomplete(text):
         # Не делаем 3 ретрая, чтобы не жечь лимит. Один лёгкий повтор с другой температурой.
         try:
-            raw2 = await gemini_call(prompt, temperature=0.65, max_tokens=1400)
+            raw2 = await gemini_call(prompt, temperature=0.55, max_tokens=2400)
             text2 = clamp_percentages(soft_fix(raw2.strip()))
             if not is_obviously_bad(text2):
                 text = text2
@@ -470,7 +719,7 @@ def extract_news_text(message: Message) -> str:
     return re.sub(re.escape(TRIGGER_HASHTAG), "", raw, flags=re.IGNORECASE).strip()
 
 
-def trim_for_telegram(text: str, limit: int = 3900) -> str:
+def trim_for_telegram(text: str, limit: int = 4050) -> str:
     if len(text) <= limit:
         return text
     cut = text[:limit]
