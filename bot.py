@@ -360,29 +360,81 @@ def remove_template_country_lines(text: str) -> str:
     return text
 
 
+VERDICT_CACHE: dict[str, str] = {}
+LAST_429_UNTIL: float = 0.0
+
+
+def cache_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())[:1500]
+
+
 async def generate_verdict(news_text: str) -> str:
+    """
+    Anti-limit mode:
+    - 1 Gemini request per post, not 3
+    - cache repeated posts
+    - if quota/rate limit hits, returns readable message instead of crashing
+    """
+    global LAST_429_UNTIL
+
+    import time
+
+    key = cache_key(news_text)
+    if key in VERDICT_CACHE:
+        return VERDICT_CACHE[key]
+
+    now = time.time()
+    if LAST_429_UNTIL and now < LAST_429_UNTIL:
+        mins = max(1, int((LAST_429_UNTIL - now) // 60))
+        return (
+            "⚠️ Лимит ИИ временно исчерпан.\n\n"
+            f"Gemini отклонил запросы из-за квоты/частоты. Попробуй примерно через {mins} мин.\n"
+            "Бот не упал — он просто ждёт обновления лимита."
+        )
+
     prompt = (
         "Сделай вердикт строго по этому посту. "
         "Не повторяй старые шаблоны. "
-        "Особенно запрещено выдавать шаблон про военное усиление России, если пост не только об этом. "
-        "В блоке 'Изменения по странам' каждая страна должна иметь УНИКАЛЬНЫЕ последствия, а не одинаковые строки. "
+        "В блоке 'Изменения по странам' каждая страна должна иметь уникальные последствия, а не одинаковые строки. "
         "Не придумывай энергетику/нефть/баррели, если этого нет.\n\n"
-        f"Пост:\n{news_text[:4000]}"
+        f"Пост:\n{news_text[:3500]}"
     )
 
-    last = ""
-    for temperature in (0.35, 0.55, 0.75):
-        raw = await gemini_call(prompt, SYSTEM_PROMPT, temperature=temperature, max_tokens=2200, attempts=2)
-        text = normalize_text(raw)
-        text = clamp_percentages(text)
-        text = clean_country_garbage(text)
+    try:
+        raw = await gemini_call(prompt, temperature=0.35, max_tokens=1400, attempts=1)
+    except Exception as exc:
+        err = str(exc)
 
-        last = text
+        if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower() or "Too Many Requests" in err:
+            # Google often returns retryDelay like 54s, but free daily quota may need much longer.
+            # Cooldown prevents spam-retrying and burning logs.
+            LAST_429_UNTIL = time.time() + 10 * 60
+            return (
+                "⚠️ Лимит Gemini API исчерпан.\n\n"
+                "Причина: 429 Too Many Requests / RESOURCE_EXHAUSTED.\n"
+                "Подожди обновления квоты или поставь другой GEMINI_API_KEY.\n"
+                "Бот живой, но ИИ сейчас не отвечает."
+            )
 
-        if is_complete(text) and not is_bad_template(text) and not has_repeated_country_changes(text):
-            return text
+        log.exception("gemini generation failed")
+        return "⚠️ Ошибка генерации вердикта. Смотри логи Railway."
 
-    return last.strip()
+    text = normalize_text(raw)
+    text = clamp_percentages(text)
+    text = clean_country_garbage(text)
+    text = cleanup_model_garbage(text)
+    text = clamp_percentages(text)
+
+    # if output is obviously bad, do NOT retry; retries burn quota.
+    if not is_complete(text):
+        text = text.strip()
+        if len(text) < 50:
+            text = "⚠️ ИИ вернул слишком короткий ответ. Повтори позже."
+
+    if not is_bad_template(text) and not has_repeated_country_changes(text):
+        VERDICT_CACHE[key] = text
+
+    return text.strip()
 
 
 def has_trigger(text: str) -> bool:
