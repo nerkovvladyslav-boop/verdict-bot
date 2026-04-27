@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import sys
-import aiohttp
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -36,9 +35,6 @@ BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
 GEMINI_API_KEY = env("AI_INTEGRATIONS_GEMINI_API_KEY") or env("GEMINI_API_KEY", required=True)
 GEMINI_BASE_URL = env("AI_INTEGRATIONS_GEMINI_BASE_URL") or env("GEMINI_BASE_URL")
 GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_BACKUP_MODEL = env("GEMINI_BACKUP_MODEL", "gemini-2.5-flash-lite")
-OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = env("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
 
 # fallback стоит под твой старый канал, чтобы бот не молчал
 RAW_CHANNEL_ID = env("TELEGRAM_CHANNEL_ID", "-1003993603387").strip()
@@ -140,62 +136,23 @@ SYSTEM_PROMPT = """
 - В изменениях по странам нужна конкретика: $, чел, ед. техники, объектов, часов, п.п.
 - Не пиши абстрактно: влияние +10, стабильность -50.
 
-СТРОГОЕ ПРАВИЛО ДЛЯ БЛОКА "💰 Изменения по странам":
-Пиши ТОЛЬКО КОНКРЕТНЫЕ материальные изменения.
+КРИТИЧЕСКОЕ ПРАВИЛО:
+- Не используй шаблоны.
+- Не повторяй старые вердикты.
+- Не подставляй одинаковые строки всем странам.
+- Каждая страна/организация получает разные последствия.
+- Если Россия инициатор — у России расходы/люди/техника.
+- Если ЕС/НАТО затронуты — у них ответные расходы/миссии/усиление контроля, а не такая же переброска войск.
+- Не пиши одинаково: "военные расходы +45 млн $; личный состав +2500 чел." всем участникам.
+- Не пиши "Россия проводит военное усиление" если в посте другое событие.
+- Блок "Изменения по странам" должен быть связан с конкретным текстом поста.
 
-ЗАПРЕЩЕНО писать:
-- репутация
-- влияние
-- имидж
-- доверие
-- стабильность
-- престиж
-- политический вес
-- много
-- значительно
-- сильно
-- огромно
-- неизвестно
-- несколько
-- десятки
-- сотни
-- тысячи
-- п.п. без прямого контекста выборов/рейтингов/опросов
-- единиц без числа
-
-РАЗРЕШЕНО:
-- деньги: $, €, млн $, млрд $
-- люди: чел.
-- техника/ракеты/дроны/системы: ед., шт.
-- объёмы: тонн, м³, литров, баррелей, МВт
-- инфраструктура: объектов, баз, заводов, станций, км
-- контракты/проекты: контрактов, проектов, систем
-
-КАЖДЫЙ показатель ОБЯЗАН иметь ЧИСЛО и единицу.
-
-РЕАЛИСТИЧНЫЕ ДИАПАЗОНЫ:
-- мелкая программа: 100 тыс–5 млн $
-- средняя госпрограмма: 5–80 млн $
-- крупная реформа/инфраструктура: 80–700 млн $
-- военная переброска: 300–8000 чел., 10–250 ед. техники
-- ракетный удар: 10–500 ракет/БПЛА, ущерб 10 млн–3 млрд $
-- IT/стартапы: 5–200 млн $, 10–300 компаний/проектов
-- агротехнологии: 1–150 млн $, 5–500 систем, 1–500 млн литров воды
-- энергетика: 10–500 млн $, 10–1000 МВт, 10 тыс–5 млн баррелей/м³
-
-Правильно:
-• Израиль: экспорт агротехнологий +90 млн $; установлено 120 систем орошения — расширение проектов.
-• Китай: ракеты -300 ед.; военные расходы +1,2 млрд $ — массированный удар.
-• Тайвань: ущерб энергосетям +900 млн $; повреждено 18 объектов ПВО — ракетные удары.
-• Норвегия: военные расходы +45 млн $; личный состав у границы +2500 чел. — переброска войск.
-
-Запрещено:
-• Израиль: репутация +1 п.п.
-• Китай: влияние +10
-• Тайвань: инфраструктура -много %
-• США: доверие -значительно
-
-Если точных данных нет — оцени приблизительно в пределах реалистичного диапазона, но всё равно ставь числа.
+ЗАПРЕЩЁННЫЕ ФРАЗЫ:
+- ограниченный управляемый эффект
+- административные расходы +700 тыс
+- экспортная выручка +8 млн
+- поставки +30 тыс баррелей
+- военные расходы +45 млн $; личный состав +2500 чел. — усиление группировки
 """
 
 
@@ -231,163 +188,6 @@ async def gemini_call(prompt: str, system: str, temperature: float = 0.45, max_t
             await asyncio.sleep(2 ** i)
 
     raise RuntimeError(f"gemini failed: {last_err}")
-
-
-
-async def openrouter_call(prompt: str, system: str, temperature: float = 0.45, max_tokens: int = 1800) -> str:
-    """
-    Backup provider. Requires OPENROUTER_API_KEY in Railway Variables.
-    """
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is missing")
-
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://railway.app",
-        "X-Title": "WORLD OF RETURN Verdict Bot",
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status >= 400:
-                raise RuntimeError(f"openrouter failed {resp.status}: {data}")
-
-            try:
-                text = data["choices"][0]["message"]["content"].strip()
-            except Exception:
-                text = ""
-
-            if not text:
-                raise RuntimeError(f"openrouter empty response: {data}")
-
-            return text
-
-
-def fallback_local_generate(news_text: str) -> str:
-    """
-    Last-resort no-AI fallback. It keeps the bot alive when all AI quotas fail.
-    """
-    raw = (news_text or "").strip()
-    low = raw.lower()
-
-    countries = []
-    aliases = {
-        "норвег": "Норвегия", "росси": "Россия", "рф": "Россия", "китай": "Китай",
-        "тайван": "Тайвань", "сша": "США", "иран": "Иран", "израил": "Израиль",
-        "украин": "Украина", "турц": "Турция", "алжир": "Алжир", "тунис": "Тунис",
-        "беларус": "Беларусь", "герман": "Германия", "франц": "Франция",
-        "брит": "Великобритания", "ес": "ЕС", "нато": "НАТО",
-    }
-    for key, val in aliases.items():
-        if key in low and val not in countries:
-            countries.append(val)
-
-    if not countries:
-        countries = ["Основная сторона"]
-
-    if any(w in low for w in ["войск", "границ", "арм", "бригад", "база", "учен", "пво", "рак", "удар", "дрон", "бпла"]):
-        verdict = f"{countries[0]} проводит военное усиление, повышая давление на региональную безопасность."
-        plus = f"{countries[0]}: усиливает оперативную готовность и контроль направления."
-        minus = "Регион: растёт риск эскалации, инцидентов и ответных мер."
-        effect = ("• Экономика: -1%\n• Военка: +3%\n• Политика: +1%\n• Общество: -1%\n• Дипломатия: -2%\n• ИТОГ: 0% — военное усиление с дипломатическими рисками.")
-        changes = "\n".join([f"• {c}: военные расходы +45 млн $; личный состав +2500 чел. — усиление группировки." for c in countries])
-        realism = "Реалистично при наличии снабжения, подготовленных частей и политического решения."
-    elif any(w in low for w in ["it", "стартап", "цифров", "техно", "сэз", "компан"]):
-        verdict = f"{countries[0]} запускает технологическое развитие, снижая зависимость от сырьевых доходов."
-        plus = f"{countries[0]}: получает рост IT-сектора и новых рабочих мест."
-        minus = f"{countries[0]}: нужны бюджет, кадры и защита от коррупции при льготах."
-        effect = ("• Экономика: +2%\n• Военка: 0%\n• Политика: +1%\n• Общество: +1%\n• Дипломатия: +1%\n• ИТОГ: +1% — умеренное технологическое усиление.")
-        changes = "\n".join([f"• {c}: инвестиции в IT +80 млн $; новых проектов +120 ед. — запуск техзон." for c in countries])
-        realism = "Реалистично при поэтапном финансировании, налоговых льготах и контроле заявок."
-    elif any(w in low for w in ["агро", "орош", "урож", "вода", "ферм", "сельск"]):
-        verdict = f"{countries[0]} усиливает агротехнологический сектор за счёт водосберегающих решений."
-        plus = f"{countries[0]}: повышает эффективность сельского хозяйства и экспорт технологий."
-        minus = f"{countries[0]}: нужны капитальные вложения и сервисное сопровождение проектов."
-        effect = ("• Экономика: +2%\n• Военка: 0%\n• Политика: 0%\n• Общество: +1%\n• Дипломатия: +1%\n• ИТОГ: +1% — практический технологический плюс.")
-        changes = "\n".join([f"• {c}: экспорт агротехнологий +90 млн $; систем орошения +120 ед. — внедрение решений." for c in countries])
-        realism = "Реалистично, если есть технологическая база, партнёры и финансирование внедрения."
-    else:
-        verdict = f"{countries[0]} проводит инициативу с ограниченным, но заметным управленческим эффектом."
-        plus = f"{countries[0]}: получает пространство для дальнейших действий."
-        minus = f"{countries[0]}: несёт дополнительные расходы и риски реализации."
-        effect = ("• Экономика: +1%\n• Военка: 0%\n• Политика: +1%\n• Общество: 0%\n• Дипломатия: 0%\n• ИТОГ: +1% — ограниченный эффект.")
-        changes = "\n".join([f"• {c}: бюджет программы +25 млн $; проектов +18 ед. — реализация инициативы." for c in countries])
-        realism = "Реалистично при достаточном бюджете, сроках и административном контроле."
-
-    return f"""📌 Вердикт
-{verdict}
-
-🌍 Страны: {", ".join(countries)}.
-
-➕ Плюсы
-• {plus}
-
-➖ Минусы
-• {minus}
-
-📈 Эффект (%)
-{effect}
-
-💰 Изменения по странам
-{changes}
-
-⚠️ Реализм
-{realism}
-
-🤝 Ответ на ультиматум/требование
-Не применимо."""
-
-
-async def ai_call_multi(prompt: str, system: str, temperature: float = 0.45, max_tokens: int = 1800) -> str:
-    """
-    Provider chain:
-    1) Gemini main model
-    2) Gemini backup model
-    3) OpenRouter model if OPENROUTER_API_KEY exists
-    4) Local fallback without AI
-    """
-    # 1. Gemini main
-    try:
-        return await gemini_call(prompt, system, temperature=temperature, max_tokens=max_tokens, attempts=1)
-    except Exception as exc:
-        log.warning("Gemini main failed: %s", exc)
-
-    # 2. Gemini backup model
-    global GEMINI_MODEL
-    original_model = GEMINI_MODEL
-    try:
-        GEMINI_MODEL = GEMINI_BACKUP_MODEL
-        return await gemini_call(prompt, system, temperature=temperature, max_tokens=max_tokens, attempts=1)
-    except Exception as exc:
-        log.warning("Gemini backup failed: %s", exc)
-    finally:
-        GEMINI_MODEL = original_model
-
-    # 3. OpenRouter
-    try:
-        return await openrouter_call(prompt, system, temperature=temperature, max_tokens=max_tokens)
-    except Exception as exc:
-        log.warning("OpenRouter failed: %s", exc)
-
-    # 4. Local fallback
-    return fallback_local_generate(prompt)
 
 
 def strip_html(text: str) -> str:
@@ -485,189 +285,6 @@ def clean_country_garbage(text: str) -> str:
     return text[:m.start()] + new_line + text[m.end():]
 
 
-def cleanup_model_garbage(text: str) -> str:
-    """
-    Чистит типичные артефакты модели:
-    - дубли ":", "(%)", "на ультиматум/требование"
-    - слова "много/значительно" вместо чисел
-    """
-    text = str(text or "")
-
-    # убрать отдельные мусорные строки
-    text = re.sub(r"(?m)^\s*:\s*$", "", text)
-    text = re.sub(r"(?m)^\s*\(%\)\s*$", "", text)
-    text = re.sub(r"(?m)^\s*на ультиматум/требование\s*$", "", text, flags=re.IGNORECASE)
-
-    # убрать строку-дубль стран сразу после "🌍 Страны: ..."
-    lines = text.splitlines()
-    cleaned = []
-    last_country_line_payload = None
-    skip_next_duplicate = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        if stripped.startswith("🌍 Страны:"):
-            payload = stripped.replace("🌍 Страны:", "").strip().strip(".")
-            last_country_line_payload = payload
-            cleaned.append(line)
-            skip_next_duplicate = True
-            continue
-
-        if skip_next_duplicate and last_country_line_payload:
-            candidate = stripped.strip(".")
-            if candidate == last_country_line_payload or candidate == ":":
-                skip_next_duplicate = False
-                continue
-            skip_next_duplicate = False
-
-        cleaned.append(line)
-
-    text = "\n".join(cleaned)
-
-    # заменить "-много %" и подобное на адекватные числа
-    replacements = {
-        r"[-+]?много\s*%": "-8%",
-        r"[-+]?значительно\s*%": "-6%",
-        r"[-+]?сильно\s*%": "-6%",
-        r"[-+]?огромно\s*%": "-8%",
-        r"[-+]?много\s*п\.п\.": "-5 п.п.",
-        r"[-+]?значительно\s*п\.п\.": "-4 п.п.",
-        r"[-+]?сильно\s*п\.п\.": "-4 п.п.",
-        r"[-+]?огромно\s*п\.п\.": "-5 п.п.",
-        r"[-+]?много\s*ед\.?": "-50 ед.",
-        r"[-+]?много\s*единиц": "-50 ед.",
-        r"[-+]?значительно": "-5%",
-        r"[-+]?много": "-5%",
-    }
-
-    for pat, rep in replacements.items():
-        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
-
-    # убрать повторы заголовка эффекта
-    text = text.replace("📈 Эффект (%)\n(%)", "📈 Эффект (%)")
-    text = text.replace("🤝 Ответ на ультиматум/требование\nна ультиматум/требование", "🤝 Ответ на ультиматум/требование")
-
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def infer_event_type(text: str) -> str:
-    low = text.lower()
-    if any(w in low for w in ["ракеты", "ракет", "удар", "обстрел", "бомб", "пво", "дроны", "бпла", "шахед"]):
-        return "strike"
-    if any(w in low for w in ["войск", "границ", "переброс", "база", "арм", "учен", "бригад", "батальон", "дивиз", "техника"]):
-        return "military"
-    if any(w in low for w in ["it", "айти", "стартап", "технопарк", "цифров", "сэз", "компан"]):
-        return "it"
-    if any(w in low for w in ["агро", "орошен", "урож", "вода", "ферм", "сельск"]):
-        return "agro"
-    if any(w in low for w in ["газ", "нефт", "энерг", "электро", "мвт", "трубопровод"]):
-        return "energy"
-    if any(w in low for w in ["завод", "производ", "инфраструкт", "дорог", "порт", "аэропорт"]):
-        return "infrastructure"
-    if any(w in low for w in ["выбор", "парт", "правитель", "парламент", "президент"]):
-        return "politics"
-    return "general"
-
-
-def material_line_for_country(country: str, event_type: str, source_text: str) -> str:
-    c = country.strip().strip(".")
-    low = source_text.lower()
-
-    if event_type == "strike":
-        if any(x in c.lower() for x in ["китай", "россия", "иран", "сша", "израиль"]):
-            return f"• {c}: боеприпасы <b>-180 ед.</b>; военные расходы <b>+650 млн $</b> — проведение ударов."
-        return f"• {c}: ущерб инфраструктуре <b>+420 млн $</b>; повреждено объектов <b>+14 ед.</b> — последствия ударов."
-
-    if event_type == "military":
-        return f"• {c}: военные расходы <b>+45 млн $</b>; личный состав <b>+2500 чел.</b> — переброска и усиление группировки."
-
-    if event_type == "it":
-        return f"• {c}: инвестиции в IT <b>+80 млн $</b>; новых проектов <b>+120 ед.</b> — запуск техзон и стартап-программ."
-
-    if event_type == "agro":
-        return f"• {c}: экспорт агротехнологий <b>+90 млн $</b>; систем орошения <b>+120 ед.</b> — внедрение водосберегающих решений."
-
-    if event_type == "energy":
-        return f"• {c}: энергетические инвестиции <b>+140 млн $</b>; мощность проектов <b>+220 МВт</b> — расширение энергетического направления."
-
-    if event_type == "infrastructure":
-        return f"• {c}: инфраструктурные расходы <b>+180 млн $</b>; объектов <b>+9 ед.</b> — запуск строительных работ."
-
-    if event_type == "politics":
-        return f"• {c}: бюджет кампании <b>+12 млн $</b>; административные расходы <b>+3 млн $</b> — политическая мобилизация."
-
-    return f"• {c}: бюджет программы <b>+25 млн $</b>; проектов <b>+18 ед.</b> — реализация инициативы."
-
-
-def extract_countries_from_text(text: str) -> list[str]:
-    m = re.search(r"🌍 Страны:\s*([^\n]+)", text)
-    if not m:
-        return []
-    raw = m.group(1).strip().strip(".")
-    parts = [p.strip().strip(".") for p in raw.split(",")]
-    banned = {"арктика", "севморпуть", "северный морской путь", "регион", "граница", "границы"}
-    out = []
-    for p in parts:
-        if not p:
-            continue
-        if p in {"РФ", "Российская Федерация"}:
-            p = "Россия"
-        if p.lower() in banned:
-            continue
-        if p not in out:
-            out.append(p)
-    return out[:5]
-
-
-def fix_material_country_changes(text: str, source_text: str = "") -> str:
-    """
-    Переписывает блок 'Изменения по странам', если модель дала абстракцию:
-    репутация/влияние/доверие/имидж/стабильность или проценты без материальной конкретики.
-    """
-    event_type = infer_event_type(source_text + "\n" + text)
-
-    countries = extract_countries_from_text(text)
-    if not countries:
-        countries = ["Основная сторона"]
-
-    start = text.find("💰 Изменения по странам")
-    if start == -1:
-        return text
-
-    next_headers = ["⚠️ Реализм", "🤝 Ответ"]
-    end = len(text)
-    for h in next_headers:
-        pos = text.find(h, start + 1)
-        if pos != -1:
-            end = min(end, pos)
-
-    block = text[start:end]
-
-    abstract_words = [
-        "репутац", "влияни", "имидж", "довер", "стабильност", "престиж",
-        "политический вес", "много", "значительно", "сильно", "неизвестно",
-        "п.п.", "безопасность +", "эффективность +"
-    ]
-
-    # Check if block has actual material units
-    material_units = ["$", "€", "млн", "млрд", "чел", "ед", "шт", "тонн", "м³", "литр", "баррел", "мвт", "км", "объект", "контракт", "проект", "систем"]
-    has_material = any(u in block.lower() for u in material_units)
-    has_abstract = any(w in block.lower() for w in abstract_words)
-
-    # If model wrote good material block, only clean leftover abstract segments lightly
-    if has_material and not has_abstract:
-        return text
-
-    new_lines = ["💰 Изменения по странам"]
-    for c in countries:
-        new_lines.append(material_line_for_country(c, event_type, source_text))
-
-    new_block = "\n".join(new_lines) + "\n\n"
-    return text[:start] + new_block + text[end:].lstrip()
-
-
 REQUIRED = [
     "📌 Вердикт",
     "🌍 Страны",
@@ -688,6 +305,9 @@ def is_bad_template(text: str) -> bool:
         "административные расходы +700 тыс",
         "ограниченный управляемый эффект",
         "дополнительная экспортная выручка",
+        "Россия проводит военное усиление, повышая давление на региональную безопасность",
+        "военные расходы +45 млн $; личный состав +2500 чел",
+        "усиление группировки",
     ]
     return any(x in low for x in bad_phrases)
 
@@ -696,25 +316,73 @@ def is_complete(text: str) -> bool:
     return all(x in text for x in REQUIRED) and len(text) > 350
 
 
+
+def has_repeated_country_changes(text: str) -> bool:
+    start = text.find("💰 Изменения по странам")
+    if start == -1:
+        return False
+
+    end = len(text)
+    for h in ["⚠️ Реализм", "🤝 Ответ"]:
+        p = text.find(h, start + 1)
+        if p != -1:
+            end = min(end, p)
+
+    block = text[start:end]
+    lines = [x.strip() for x in block.splitlines() if x.strip().startswith("•")]
+    if len(lines) < 2:
+        return False
+
+    # Compare content after colon. If 2+ countries have almost same effect line, reject.
+    tails = []
+    for line in lines:
+        if ":" in line:
+            tails.append(line.split(":", 1)[1].strip().lower())
+
+    if len(tails) < 2:
+        return False
+
+    # exact repeated tails
+    if len(set(tails)) < len(tails):
+        return True
+
+    repeated_markers = [
+        "военные расходы +45 млн $; личный состав +2500 чел",
+        "административные расходы +700 тыс",
+        "экспортная выручка +8 млн",
+    ]
+    return any(marker in block.lower() for marker in repeated_markers)
+
+
+def remove_template_country_lines(text: str) -> str:
+    # Do not invent replacement lines. Just marks output as bad by detector;
+    # generation will retry. This function only cleans old duplicate country payload.
+    return text
+
+
 async def generate_verdict(news_text: str) -> str:
     prompt = (
         "Сделай вердикт строго по этому посту. "
         "Не повторяй старые шаблоны. "
+        "Особенно запрещено выдавать шаблон про военное усиление России, если пост не только об этом. "
+        "В блоке 'Изменения по странам' каждая страна должна иметь УНИКАЛЬНЫЕ последствия, а не одинаковые строки. "
         "Не придумывай энергетику/нефть/баррели, если этого нет.\n\n"
         f"Пост:\n{news_text[:4000]}"
     )
 
-    raw = await ai_call_multi(prompt, SYSTEM_PROMPT, temperature=0.45, max_tokens=1800)
+    last = ""
+    for temperature in (0.35, 0.55, 0.75):
+        raw = await gemini_call(prompt, SYSTEM_PROMPT, temperature=temperature, max_tokens=2200, attempts=2)
+        text = normalize_text(raw)
+        text = clamp_percentages(text)
+        text = clean_country_garbage(text)
 
-    text = normalize_text(raw)
-    text = clamp_percentages(text)
-    text = clean_country_garbage(text)
-    text = cleanup_model_garbage(text)
-    text = fix_material_country_changes(text, news_text)
-    text = cleanup_model_garbage(text)
-    text = clamp_percentages(text)
+        last = text
 
-    return text.strip()
+        if is_complete(text) and not is_bad_template(text) and not has_repeated_country_changes(text):
+            return text
+
+    return last.strip()
 
 
 def has_trigger(text: str) -> bool:
@@ -870,4 +538,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
+    
